@@ -576,7 +576,6 @@ sub _get_queryexp_title_exact
 	
 	my $title = $eprint->get_value( "title" );
 	$title = $plugin->_clean_title( $title );
-	$title = 
 		
 	my $query_expression = 'Ti=' . $plugin->_get_quoted_value( $title );
 
