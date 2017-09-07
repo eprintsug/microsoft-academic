@@ -1,0 +1,2824 @@
+#!/usr/bin/perl -w -I/usr/local/eprints/perl_lib
+
+###############################################################################
+#
+# Map EPrints repository data to Microsoft Academic Graph data.
+#
+###############################################################################
+#
+#  Copyright 2016 University of Zurich. All Rights Reserved.
+#
+#  Martin Brändle
+#  Zentrale Informatik
+#  Universität Zürich
+#  Stampfenbachstr. 73
+#  CH-8006 Zürich
+#  
+#  The plug-ins are free software; you can redistribute them and/or modify
+#  them under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#  
+#  The plug-ins are distributed in the hope that they will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#  
+#  You should have received a copy of the GNU General Public License
+#  along with EPrints 3; if not, write to the Free Software
+#  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+######################################################################
+
+
+=pod
+
+=head1 NAME
+
+B<academic_search> - Map EPrints repository data to Microsoft Academic Graph data
+
+=head1 SYNOPSIS
+
+B<academic_search> I<repository_id> [B<options>] [I<eprint_id> I<eprint_id> ...]
+
+=head1 DESCRIPTION
+
+Descriptions
+
+=head1 ARGUMENTS
+
+=over 8
+
+=item [I<eprint_id> I<eprint_id> ...]
+
+A list of eprint_ids used for synchronizing. If not specified, the complete dataset will be used.
+
+=back
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--help>
+
+Print a brief help message and exit.
+
+=item B<--man>
+
+Print the full manual page and then exit.
+
+=item B<--quiet>
+
+Be vewwy vewwy quiet. This option will supress all output unless an error occurs.
+
+=item B<--verbose>
+
+Explain in detail what is going on.
+May be repeated for greater effect.
+
+=item B<--limit> I<n>
+
+Limits the number of queries to the first n eprints.
+
+=item B<--mode> I<mode>
+
+Defines mode of requests. Possible modes are: title_words, title_exact, id, doi (DOI not yet possible),
+and read. The read mode does not carry out requests, but reads existing MS Academic Knowledge API data
+from the file system.
+Default mode: title_words
+
+=item B<--dir DIRECTORY>
+
+Stores the XML report in DIRECTORY and the MS Academic Knowlegde API responses in DIRECTORY/json. 
+If nothing is specified, <eprints_root>/var/msapi/ is used for DIRECTORY.
+The filename for each requested eprint is msapi_{eprintid}.txt
+
+=item B<--mapping FILE>
+
+Specifies the path for a mapping.csv file that defines the mapping from the institute IDs (subjectid) to
+disciplines. If nothing is specified, <eprints_root>/var/msapi/mapping.csv is used for FILE.
+The first column of the CSV file is the institute ID, the second the discipline. If an eprint has 
+different subjectid than in the CSV list of subjectids, the discipline "Other" is assigned.
+
+=item B<--restart>
+
+Tries a restart. Does a --read for all dowloaded msapi_{eprintid}.txt documents that already exist in 
+the results directory, then continues querying with the mode indicated with --mode. 
+
+=back
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use EPrints;
+use Encode;
+use JSON;
+use Search::Xapian;
+use Text::CSV;
+use XML::LibXML;
+use Data::Dumper;
+
+#
+# Global variables
+#
+my $report = {};
+
+#
+# Rules for mapping faculties to disciplines
+#
+my $mapping = {};
+
+#
+# Parameters for command line options
+#
+my $help = 0;
+my $man = 0;
+my $verbose = 0;
+my $quiet = 0;
+my $limit = 999999999;
+my $restart = 0;
+my $mode = 'title_words';
+my $report_dir = '';
+my $mapping_file = '';
+
+#
+# Parse the command line options
+#
+Getopt::Long::Configure("permute");
+GetOptions(
+	'help|?' => \$help,
+	'man' => \$man,
+	'verbose+' => \$verbose,
+	'quiet' => \$quiet,
+	'limit=s' => \$limit,
+	'mode=s' => \$mode,
+	'dir=s' => \$report_dir,
+	'mapping=s' => \$mapping_file,
+	'restart' => \$restart,
+) || pod2usage( 2 );
+
+#
+# Print out help screens, if desired
+#
+pod2usage( 1 ) if $help;
+pod2usage( -exitstatus => 0, -verbose => 2 ) if $man;
+pod2usage( 2 ) if( scalar @ARGV < 1 ); 
+
+#
+# Configure verbosity
+#
+my $noise = 1;
+$noise = 0 if( $quiet );
+$noise = 1 + $verbose if( $verbose );
+
+#
+# Get an EPrints session and the live dataset
+#
+my $repoid = $ARGV[0];
+
+my $session = EPrints::Session->new( 1, $repoid, $noise );
+if ( !defined $session )
+{
+	print STDERR "Failed to load repository: $repoid\n";
+	exit 1;
+}
+
+my $repository = $session->get_repository;
+my $dataset = $session->get_repository->get_dataset( "archive" );
+
+
+if ( !defined $dataset )
+{
+	print STDERR "Could not access the live archive!\n";
+	$session->terminate;
+	exit 1;
+}
+
+#
+# Read discipline mappings
+#
+if ($mapping_file eq '')
+{
+	$mapping_file = $repository->get_conf( "base_path" ) . '/var/msapi/mapping.csv';
+}
+read_mapping( $mapping, $mapping_file, $verbose );
+
+#
+# Read configuration parameters
+#
+my $apikey = $repository->config( "msapi", "apikey" );
+my $baseuri = $repository->config( "msapi", "uri" );
+my $msapi_fields = $repository->config( "msapi", "msapi_fields");
+my $msapi_answer_count = $repository->config( "msapi", "answer_count");
+my $crawl_retry = $repository->config( "msapi", "crawl_retry");
+my $crawl_delay = $repository->config( "msapi", "crawl_delay");
+my $eprint_fields = $repository->config( "msapi", "eprint_fields" );
+my $institution_id = $repository->config( "msapi", "affiliation_id" );
+
+if ($report_dir eq '')
+{
+	$report_dir = $repository->get_conf( "base_path" ) . '/var/msapi';
+}
+else
+{
+	if (! -d $report_dir )
+	{
+		print STDERR "Directory $report_dir does not exist!\n";
+		$session->terminate;
+		exit 1;
+	} 
+}
+
+create_dirs($report_dir);
+
+my $param;
+
+$param->{mode} = $mode;
+$param->{limit} = $limit;
+$param->{verbose} = $verbose;
+$param->{noise} = $noise;
+$param->{report} = $report;
+$param->{apikey} = $apikey;
+$param->{baseuri} = $baseuri;
+$param->{report_dir} = $report_dir;
+$param->{msapi_fields} = $msapi_fields;
+$param->{answer_count} = $msapi_answer_count;
+$param->{crawl_retry} = $crawl_retry;
+$param->{crawl_delay} = $crawl_delay;
+$param->{institution_id} = $institution_id;
+$param->{eprint_fields} = $eprint_fields;
+
+#
+# Carry out the queries and gather the results
+#
+my $eplist;
+
+if ( scalar(@ARGV) > 1 )
+{
+	# for specific eprintids in the live archive
+	my $plist = "";
+	
+	for (my $i = 0; $i < scalar(@ARGV); $i++)
+	{
+		$plist = $plist . $ARGV[$i] . " ";
+	}
+
+	$plist = substr($plist,0,-1) if (length($plist) > 0);
+	
+	my $epexp = EPrints::Search->new(
+   		session => $session,
+   		dataset => $dataset,
+   		order => "eprintid",
+   	);
+   	
+   	$epexp->add_field(
+   		$dataset->get_field("eprintid"),
+   		$plist,
+   		"EQ",
+   		"ANY",
+   	);
+   	
+   	$eplist = $epexp->perform_search;
+}
+else
+{
+	$eplist = $dataset->search;
+}
+$eplist->map( \&process_records, $param );
+
+#
+# Apply the mapping (organisation ids --> disciplines)
+#
+apply_mapping ( $mapping, $param );
+
+#
+# Save the report as XML file
+#
+save_report_xml( $param );
+
+#
+# Save the report as CSV file
+#
+save_report_csv( $param );
+
+
+$session->terminate();
+
+exit;
+
+#
+# Gather the result(s). This is the workhorse.
+#
+sub process_records
+{
+	my ($session, $dataset, $eprint, $param) = @_;
+
+	my $verbose = $param->{verbose};
+	my $limit = $param->{limit};
+	my $mode = $param->{mode};
+
+    my $ms_data;
+	
+	my $eprintid = $eprint->get_value( "eprintid" );
+	return if $eprintid > $limit;
+	
+	print STDOUT "Processing eprint $eprintid\n" if $verbose;
+	
+	if ($mode eq 'read')
+	{
+		$ms_data = read_json_response($eprintid, $param); 
+	}
+	else
+	{
+		my $do_query = 1;
+		if ($restart)
+		{
+			my $json_dir = $param->{report_dir} . '/json';
+			my $filename =  $json_dir . '/msapi_' . sprintf('%06s',$eprintid) . '.txt';
+			if (-e $filename)
+			{
+				$do_query = 0;
+				$ms_data = read_json_response($eprintid, $param); 
+			}
+		}
+		if ($do_query)
+		{
+			my $request_url = build_request( $session, $eprint, $param);
+		
+			if ($request_url ne '')
+			{
+				$ms_data = submit_request($eprintid, $request_url, $param);
+			}
+			else
+			{
+				print STDOUT "No valid request for eprint $eprintid\n" if $verbose;
+			}
+		}
+	}
+
+	if (defined $ms_data)
+	{
+		if ($ms_data->{id} == 200 )
+		{
+			process_response($ms_data, $eprint, $param);
+		}
+		
+		if ($ms_data->{id} >= 400 && $ms_data->{id} <= 410)
+		{
+			process_error($ms_data, $eprint, $param);
+		}
+	}
+	
+	process_eprint_fields( $session, $dataset, $eprint, $param );
+	
+	return;
+}
+
+
+sub build_request
+{
+	my ($session, $eprint, $param) = @_;
+	
+	my $verbose = $param->{verbose};
+	my $eprintid = $eprint->get_value( "eprintid" );
+	
+	my $apos = "'";
+	my $request;
+	my $query_expression = '';
+	
+	if ($mode eq 'doi')
+	{
+#		Microsoft Academic does not yet have a method for querying with DOI 
+#		my $doi = $eprint->get_value( "doi" );
+#	
+#		if (defined $doi)
+#		{
+#			# create the request
+#			$report->{$eprintid}->{search_type} = "doi";
+#			# $report->{$eprintid}->{success} = "";
+#		}
+#		
+	}
+	elsif ($mode eq 'title_exact')
+	{
+		my $title = $eprint->get_value( "title" );
+		
+		$title = clean_title( $title );
+		
+		$query_expression = 'Ti=' . $apos . $title . $apos ;
+	}
+	elsif ($mode eq 'id')
+	{
+		if ( $eprint->is_set( "msapi_cluster" ) )
+		{
+			my $msapi_id = $eprint->get_value( "msapi_cluster" );
+			$query_expression = 'Id=' . $apos . $msapi_id . $apos;
+		}
+	}
+	else
+	{
+		# build the query from title words (using the terms saved in the Xapian index)
+		my $title_words;
+
+		my $path = $session->config( "variables_path" ) . "/xapian";
+		my $xapian = Search::Xapian::Database->new( $path );
+		$xapian->reopen();
+	
+		my $doccount = $xapian->get_doccount;
+		
+		my $xapian_query = Search::Xapian::Query->new(
+			Search::Xapian::OP_AND(),
+			Search::Xapian::Query->new( 'eprintid:' . $eprintid )
+		);
+	
+		my $enq = $xapian->enquire( $xapian_query );
+	
+		my @matches = $enq->matches(0, $doccount);
+	
+		foreach my $match (@matches)
+		{
+			$title_words = get_title_words( $match, 'title:', $title_words );
+		}
+		
+		if (scalar keys %$title_words > 0)
+		{	
+			foreach my $title_key (sort keys %$title_words)
+			{
+				my $word = $title_words->{$title_key};
+				if ($title_key == 0)
+				{
+					$query_expression = "W=" . $apos . $word . $apos;  
+				}
+				else
+				{
+					$query_expression = "And(" . $query_expression . ",W=" . $apos . $word . $apos . ")";  
+				}
+			}
+		}
+	}
+	
+	if ($query_expression ne '')
+	{
+		$request = $param->{baseuri};
+		$request->query_form(
+			expr => $query_expression,
+			model => 'latest',
+			count => $param->{answer_count},
+			offset => '0',
+			attributes => $param->{msapi_fields},
+		);
+	}
+	
+	return $request;
+}
+
+
+sub get_title_words
+{
+	my ( $match, $prefix, $words ) = @_;
+	
+	my $word_count = scalar(keys %$words);
+	
+	my $stopper = Search::Xapian::SimpleStopper->new( get_stopwords() );
+	
+	my $doc = $match->get_document();
+	my $termlist_iterator = $doc->termlist_begin;
+	
+	$termlist_iterator->skip_to( $prefix );
+	
+	while ( $termlist_iterator ne $doc->termlist_end )
+	{
+		my $term = $termlist_iterator->get_termname();
+		
+		if ($term =~ /^$prefix/)
+		{
+			$term =~ s/^$prefix//;
+			
+			# filter all numbers
+			if ($term =~ /^\d+$/ )
+			{
+				$termlist_iterator++;
+				next;
+			}
+			
+			# take the longer part before or after the apostrophe
+			if ($term =~ /\'/ )
+			{
+				$term =~ s/(.*?)\'(.*)/$1 $2/;
+				
+				if (length($1) > length($2))
+				{
+					$term = $1;
+				}
+				else
+				{
+					$term = $2;
+				}
+			}
+			
+			# filter stop words
+			if ( !$stopper->stop_word( $term ) )
+			{
+				$words->{$word_count} = $term;
+				$word_count++;
+			}
+		}
+		$termlist_iterator++;
+	}
+	
+	return $words;
+}
+
+sub submit_request
+{
+	my ( $eprintid, $request_url, $param ) = @_;
+	
+	my $noise = $param->{noise};
+	my $crawl_retry = $param->{crawl_retry};
+	my $crawl_delay = $param->{crawl_delay};
+	
+	print STDOUT "MS Academic Knowledge API URL: [$request_url]\n" if $noise > 1;
+
+	my $response = {};
+	my $ms_data = {};
+	
+	my $request_counter = 1;
+	my $success = 0;
+	my $req = HTTP::Request->new("GET",$request_url);
+	$req->header( "Accept" => "application/json" );
+	$req->header( "Accept-Charset" => "utf-8" );
+	$req->header( "User-Agent" => "ZORA MS Academic Knowledge API Sync; EPrints 3.3.x; www.zora.uzh.ch" );
+	$req->header( "Ocp-Apim-Subscription-Key" => $param->{apikey});
+	
+	while (!$success && $request_counter <= $crawl_retry)
+	{
+		print STDERR "Request #$request_counter\n" if ($noise >= 3);
+		my $ua = LWP::UserAgent->new;
+		$ua->env_proxy;
+		$ua->timeout(60);
+		$response = $ua->request($req);
+		$success = $response->is_success;
+		$request_counter++;
+		sleep $crawl_delay;
+	}
+	
+	$ms_data->{id} = $response->code;
+	
+	if ( $response->code == 200 || ($response->code >= 400 && $response->code <= 410) )
+	{	
+		$ms_data->{content} = $response->content;
+	}
+	else 
+	{
+		print STDERR "No response from MS Academic Knowledge API for eprint $eprintid\n";
+	}
+	
+	return $ms_data;
+}
+
+sub process_response
+{
+	my ($ms_data, $eprint, $param) = @_;
+	
+	my $verbose = $param->{verbose};
+	my $report = $param->{report};
+	
+	my $eprintid = $eprint->get_value( "eprintid" );
+	my $eprint_title = $eprint->get_value( "title" );
+	my $eprint_title_clean = clean_title( $eprint_title );
+	my $eprint_type = $eprint->get_value( "type" );
+	my $eprint_date = $eprint->get_value( "date" );
+	my $eprint_volume = $eprint->get_value( "volume" );
+    my $eprint_issue = $eprint->get_value( "number" );
+    my $eprint_pagerange = $eprint->get_value( "pagerange" );
+    
+    my $eprint_firstpage;
+    if (defined $eprint_pagerange)
+    {
+    	
+    	if ($eprint_pagerange =~ /-/ )
+    	{
+    		$eprint_pagerange =~ /(.*?)-(.*)/;
+    		$eprint_firstpage = $1;
+    	}
+    	else
+    	{
+    		$eprint_firstpage = $eprint_pagerange;
+    	}
+    }
+    
+	my $eprint_journal_series;
+	$eprint_journal_series = $eprint->get_value( "series" ) if ( $eprint->is_set( "series" ) ); 
+	$eprint_journal_series = $eprint->get_value( "publication" ) if ( $eprint->is_set( "publication" ) ); 
+
+	my $eprint_doi;
+	
+	if ($eprint->is_set( "doi" ) )
+	{
+		$eprint_doi = $eprint->get_value( "doi" );
+	}
+	
+	my $response_content = $ms_data->{content};
+	
+	# save the response as early as we can
+	save_json_response( $response_content, $eprint, $param );
+		
+	my $json_vars = JSON::decode_json($response_content);
+	
+	my $entities = $json_vars->{entities};
+	my $entity_count = scalar @$entities;
+	
+	$report->{$eprintid}->{msapi}->{result_status} = "success";
+	$report->{$eprintid}->{msapi}->{result_message} = "";
+	$report->{$eprintid}->{msapi}->{result_count} = $entity_count;
+	
+	#	
+	# Find out which answer matches
+	#
+	my $doi_match = 0;
+	my $bibliographic_match = 0;
+	my $title_match = 0;
+	
+	if ($entity_count > 0)
+	{
+		# try DOI match as well as bibliographic match and title match
+
+		my $loop = 0;
+		foreach my $entity (@$entities)
+		{
+			$loop++;
+			my $e_string = $entity->{E};
+			my $extended_metadata = parse_extended_metadata( $e_string );
+		
+			# DOI match	
+			my $msapi_doi = $extended_metadata->{DOI};
+		
+			if (defined $msapi_doi && $eprint_doi eq $msapi_doi)
+			{
+				$doi_match = $loop;
+			}
+			
+			# bibliographic match
+			my $msapi_journal = $extended_metadata->{VFN};
+			my $msapi_volume = $extended_metadata->{V};
+			my $msapi_issue = $extended_metadata->{I};
+			my $msapi_firstpage = $extended_metadata->{FP};
+			
+			# weak match first
+			if (defined $msapi_journal && defined $msapi_volume && defined $msapi_firstpage )
+			{
+				if ($eprint_journal_series eq $msapi_journal && $eprint_volume eq $msapi_volume && $eprint_firstpage eq $msapi_firstpage)
+				{
+					$bibliographic_match = $loop;
+				}
+			}
+			
+			# then stronger match
+			if (defined $msapi_journal && defined $msapi_volume && defined $msapi_issue && defined $msapi_firstpage )
+			{
+				if ($eprint_journal_series eq $msapi_journal && $eprint_volume eq $msapi_volume 
+					&& $eprint_issue eq $msapi_issue && $eprint_firstpage eq $msapi_firstpage)
+				{
+					$bibliographic_match = $loop;
+				}
+			}
+			
+			# title match
+			my $msapi_title = $entity->{Ti};
+			if (defined $msapi_title && $eprint_title_clean eq $msapi_title)
+			{
+				$title_match = $loop;
+			}
+		}
+	}
+	
+	print STDOUT "Entities: $entity_count, Matches: doi: $doi_match, bib: $bibliographic_match, title: $title_match\n" if $verbose;
+	
+	my $entity_matched;
+	
+	# select the entity based on the best match: DOI > title > bibliographic
+	$report->{$eprintid}->{msapi}->{match_type} = "none";
+	if ($bibliographic_match > 0)
+	{
+		$entity_matched = $bibliographic_match - 1;
+		$report->{$eprintid}->{msapi}->{match_type} = "bib";
+	}
+	if ($title_match > 0)
+	{
+		$entity_matched = $title_match - 1;
+		$report->{$eprintid}->{msapi}->{match_type} = "tit";
+	}
+	if ($doi_match > 0)
+	{
+		$entity_matched = $doi_match - 1;
+		$report->{$eprintid}->{msapi}->{match_type} = "doi";
+	}
+
+	if (defined $entity_matched)
+	{
+		$report->{$eprintid}->{msapi}->{matched_record} = $entity_matched + 1;
+		$report->{$eprintid}->{msapi}->{bib_match} = $bibliographic_match;
+		$report->{$eprintid}->{msapi}->{tit_match} = $title_match;
+		$report->{$eprintid}->{msapi}->{doi_match} = $doi_match;
+	}
+	else
+	{
+		$report->{$eprintid}->{msapi}->{matched_record} = 0;
+		$report->{$eprintid}->{msapi}->{bib_match} = "none";
+		$report->{$eprintid}->{msapi}->{tit_match} = "none";
+		$report->{$eprintid}->{msapi}->{doi_match} = "none";
+	}
+	
+	if (defined $entity_matched)
+	{
+		process_msapi_fields( $eprint, $entities, $entity_matched, $param );
+	}
+	else
+	{
+		empty_msapi_fields( $eprint, $param );
+	}
+	
+	return;
+}
+
+sub process_error
+{
+	my ($ms_data, $eprint, $param) = @_;
+	
+	my $report = $param->{report};
+	my $eprintid = $eprint->get_value( "eprintid" );
+	
+	my $error_id = $ms_data->{id};
+	my $response_content = $ms_data->{content};
+	
+	save_json_response( $response_content, $eprint, $param );
+		
+	my $json_vars = JSON::decode_json($response_content);
+	
+	my $error_code = $json_vars->{error}->{code};
+	my $error_message = $json_vars->{error}->{message};
+	
+	$report->{$eprintid}->{msapi}->{result_status} = "error: " . $error_code;
+	$report->{$eprintid}->{msapi}->{result_message} = $error_message;
+	$report->{$eprintid}->{msapi}->{result_count} = -1;
+	
+	print STDERR "HTTP Error $error_id, Error: $error_code, $error_message\n";
+	
+	return;
+}
+
+sub parse_extended_metadata
+{
+	my ($e_string) = @_;
+	
+	$e_string =~ s/\\"/'/g;
+	$e_string =~ s/\\//g;
+	
+	my $json = JSON->new->utf8( 0 );		
+	my $json_extended_metadata = $json->decode($e_string);
+	
+	return $json_extended_metadata;
+}
+
+sub clean_title
+{
+	my ($title) = @_;
+	
+	$title = lc $title;
+	$title =~ s/\+|\-|\x{2013}|_|<|=|>|&|%|\(|\)|\[|]|\{|}|\^|\.|,|\:|;|\?|!|'|"|\||\\|\$|\/|\*/ /g;
+	$title =~ s/\r//g;
+	$title =~ s/^\s+//;
+	$title =~ s/\s+$//;
+	$title =~ s/\s+/ /g;
+	
+	return $title;
+}
+
+sub save_json_response
+{
+	my ($response, $eprint, $param) = @_;
+	
+	my $json_dir = $param->{report_dir} . '/json';
+	
+	my $eprintid = $eprint->get_value( "eprintid" );
+	
+	my $filename =  $json_dir . '/msapi_' . sprintf('%06s',$eprintid) . '.txt';
+	open my $jsonout, ">", $filename or die "Cannot open > $filename\n";
+	print $jsonout $response;
+	close($jsonout);
+	
+	return;
+}
+
+sub process_msapi_fields
+{
+	my ( $eprint, $entities, $entity_matched, $param ) = @_;
+	
+	my $report = $param->{report};
+	my $eprintid = $eprint->get_value( "eprintid" );
+	
+	my @msapi_records = @$entities;
+	
+	my $msapi_record = $msapi_records[$entity_matched];
+	my $extended_metadata = parse_extended_metadata( $msapi_record->{E} );
+	
+	$report->{$eprintid}->{msapi}->{id} = $msapi_record->{Id};
+	$report->{$eprintid}->{msapi}->{year} = $msapi_record->{Y};
+	$report->{$eprintid}->{msapi}->{date} = $msapi_record->{D};
+	$report->{$eprintid}->{msapi}->{citation_count} = $msapi_record->{CC};
+	$report->{$eprintid}->{msapi}->{doi} = $extended_metadata->{DOI};
+	$report->{$eprintid}->{msapi}->{journal} = $extended_metadata->{VFN};
+	$report->{$eprintid}->{msapi}->{volume} = $extended_metadata->{V};
+	$report->{$eprintid}->{msapi}->{issue} = $extended_metadata->{I};
+	$report->{$eprintid}->{msapi}->{first_page} = $extended_metadata->{FP};
+	
+	#
+	# check whether the matched record has the own institution's affiliation
+	#
+	$report->{$eprintid}->{msapi}->{has_affiliation} = process_affiliation( $msapi_record, $param );
+	
+	#
+	# determine the reference count
+	#
+	$report->{$eprintid}->{msapi}->{reference_count} = process_references( $msapi_record );
+	
+	#
+	# determine the author count
+	#
+	$report->{$eprintid}->{msapi}->{author_count} = process_msapi_author_count( $msapi_record );
+	
+	return;
+}
+
+sub process_affiliation
+{
+	my ( $msapi_record, $param ) = @_;
+	
+	my $institution_id = $param->{institution_id};
+	
+	my $author_data = $msapi_record->{AA};
+	
+	my $has_affiliation = 0; 
+	
+	foreach my $author (@$author_data)
+	{
+		if (defined $author->{AfId})
+		{
+			$has_affiliation = 1 if ($author->{AfId} == $institution_id);
+		}
+	}
+	
+	return $has_affiliation;
+}
+
+sub process_references
+{
+	my ( $msapi_record ) = @_;
+	
+	my $reference_count = 0;
+	
+	my $references = $msapi_record->{RId};
+	
+	if (defined $references)
+	{
+		$reference_count = scalar(@$references);
+	}
+	
+	return $reference_count;
+}
+
+sub process_msapi_author_count
+{
+	my ( $msapi_record ) = @_;
+	
+	my $author_data = $msapi_record->{AA};
+	
+	my $author_count = 0;
+	
+	if (defined $author_data)
+	{
+		$author_count = scalar(@$author_data) ;
+	}
+	
+	return $author_count;
+}
+
+#
+# If there is no response from MA API, fill fields with empty values 
+# in order to create an aligned CSV.
+#
+sub empty_msapi_fields
+{
+	my ( $eprint, $param ) = @_;
+	
+	my $report = $param->{report};
+	my $eprintid = $eprint->get_value( "eprintid" );
+	
+	$report->{$eprintid}->{msapi}->{id} = '';
+	$report->{$eprintid}->{msapi}->{year} = '';
+	$report->{$eprintid}->{msapi}->{date} = '';
+	$report->{$eprintid}->{msapi}->{citation_count} = '';
+	$report->{$eprintid}->{msapi}->{doi} = '';
+	$report->{$eprintid}->{msapi}->{journal} = '';
+	$report->{$eprintid}->{msapi}->{volume} = '';
+	$report->{$eprintid}->{msapi}->{issue} = '';
+	$report->{$eprintid}->{msapi}->{first_page} = '';
+	$report->{$eprintid}->{msapi}->{author_count} = '';
+	
+	return;
+}
+
+
+sub process_eprint_fields
+{
+	my ($session, $dataset, $eprint, $param) = @_;
+	
+	my $report = $param->{report};
+	my $eprint_fields = $param->{eprint_fields};
+	my $eprintid = $eprint->get_value( "eprintid" );
+	
+	foreach my $fieldname (@$eprint_fields)
+	{
+		my $field = $dataset->field( $fieldname );
+		
+		my $multiple = 0;
+		$multiple = 1 if (defined $field->property( "multiple" ));
+
+	
+	    my $values = $eprint->get_value( $fieldname );
+	    
+	    $report->{$eprintid}->{eprint}->{$fieldname}->{multiple} = $multiple;
+		$report->{$eprintid}->{eprint}->{$fieldname}->{values} = $values;
+	}
+	
+	process_eprint_author_count( $session, $dataset, $eprint, $param );
+	
+	return;
+}
+
+
+sub process_eprint_author_count
+{
+	my ($session, $dataset, $eprint, $param) = @_;
+	
+	my $report = $param->{report};
+	
+	my $eprintid = $eprint->get_value( "eprintid" );
+	
+	my $creators_count = 0;
+	my $editors_count = 0;
+	
+	if ($eprint->is_set( "creators" ) )
+	{
+		my $creators = $eprint->get_value( "creators" );
+		$creators_count = scalar(@$creators);
+	}
+	
+	if ($eprint->is_set( "editors" ) )
+	{
+		my $editors = $eprint->get_value( "editors" );
+		$editors_count = scalar(@$editors);
+	}
+	
+	my $authors_count = $creators_count + $editors_count;
+	
+	
+	$report->{$eprintid}->{eprint}->{"author_count"}->{multiple} = 0;
+	$report->{$eprintid}->{eprint}->{"author_count"}->{values} = $authors_count;
+
+	return;	
+}
+
+
+sub read_json_response
+{
+	my ($eprintid, $param) = @_;
+	
+	my $verbose = $param->{verbose};
+	
+	my $json_dir = $param->{report_dir} . '/json';
+	my $filename =  $json_dir . '/msapi_' . sprintf('%06s',$eprintid) . '.txt';
+	
+	if (-e $filename )
+	{
+		my $response_data;
+		
+		open my $jsonin, "<", $filename or die "Cannot open > $filename\n";
+		local $/ = undef;
+		my $response_content = <$jsonin>;
+		close($jsonin);
+
+		print STDOUT $response_content if $verbose;
+	
+		my $json_vars = JSON::decode_json($response_content);
+		
+		# check whether we have a error message
+		if (defined $json_vars->{error}->{code})
+		{
+			$response_data->{id} = 400;
+		}
+		else
+		{
+			$response_data->{id} = 200;
+		}
+		
+		$response_data->{content} = $response_content;
+	
+		return $response_data;
+	}
+	return;
+}
+
+sub save_report_xml
+{
+	my ($param) = @_;
+	
+	my $verbose = $param->{verbose};
+	my $report = $param->{report};
+	my $report_dir = $param->{report_dir};
+	
+	my $filename = $report_dir . '/report.xml';
+	
+	print STDOUT "Saving XML report to $filename\n" if $verbose;
+	
+	my $count = scalar keys %$report;
+	
+	my $xmldoc = XML::LibXML::Document->new('1.0','utf-8');
+	my $element_records = $xmldoc->createElement( "records" );
+	$element_records->setAttribute( "count", $count );
+	
+	foreach my $recordid (sort {$a <=> $b} keys %$report)
+	{
+		my $element_record = $xmldoc->createElement( "record" );
+		$element_record->setAttribute( "id", $recordid );
+		$element_records->appendChild( $element_record );
+		
+		# eprint part
+		my $element_eprint = $xmldoc->createElement( "eprint" );
+		$element_record->appendChild( $element_eprint );
+		
+		my $eprint = $report->{$recordid}->{eprint};
+		foreach my $fieldname (keys %$eprint)
+		{
+			my $multiple = $eprint->{$fieldname}->{multiple};
+			
+			my $element_field = $xmldoc->createElement( "field" );
+			$element_field->setAttribute( "name", $fieldname );
+			$element_field->setAttribute( "multiple", $multiple );
+			$element_eprint->appendChild( $element_field );
+			
+			my $values = $eprint->{$fieldname}->{values};
+			if ($multiple == 0)
+			{
+				my $element_value = $xmldoc->createElement( "value" );
+				$element_value->appendTextNode( $values ) if defined $values;
+				$element_field->appendChild( $element_value );
+			}
+			else
+			{
+				foreach my $value (@$values)
+				{
+					my $element_value = $xmldoc->createElement( "value" );
+					$element_value->appendTextNode( $value );
+					$element_field->appendChild( $element_value );
+				}
+			}
+		}
+		
+		# msapi result part
+		my $element_msapi = $xmldoc->createElement( "msapi" );
+		$element_record->appendChild( $element_msapi );
+		
+		my $msapi = $report->{$recordid}->{msapi};
+		
+		foreach my $msapi_key (keys %$msapi)
+		{
+			my $element_field = $xmldoc->createElement( "field" );
+			$element_field->setAttribute( "name", $msapi_key );
+			$element_msapi->appendChild( $element_field );
+			
+			my $value = $msapi->{$msapi_key};
+			my $element_value = $xmldoc->createElement( "value" );
+			$element_value->appendTextNode( $value ) if defined $value;
+			$element_field->appendChild( $element_value );
+		}
+	}
+	
+	$xmldoc->setDocumentElement( $element_records );
+	my $xmldoc_string = $xmldoc->toString(1);
+	
+	open my $xmlout, ">", $filename or die "Cannot open > $filename\n";
+	print $xmlout $xmldoc_string;
+	close $xmlout;
+	
+	return;
+}
+
+sub save_report_csv
+{
+	my ($param) = @_;
+	
+	my $verbose = $param->{verbose};
+	my $report = $param->{report};
+	my $report_dir = $param->{report_dir};
+	my $quot = '"';
+	
+	my $filename = $report_dir . '/report.csv';
+	open my $csvout, ">:encoding(utf8)", $filename or die "Cannot open > $filename\n";
+	
+	print STDOUT "Saving CSV report to $filename\n" if $verbose;
+	
+	my $csv = Text::CSV->new();
+	$csv->eol ("\n");
+	
+	# print headers
+	my @headers;
+	
+	keys %$report;
+	my $recordid = each %$report;
+	
+	my $eprint = $report->{$recordid}->{eprint};
+	foreach my $fieldname (keys %$eprint)
+	{
+		push @headers, $fieldname;
+	}
+	
+	my $msapi = $report->{$recordid}->{msapi};
+	foreach my $msapi_key (keys %$msapi)
+	{
+		push @headers, $msapi_key;
+	}
+	
+	$csv->print( $csvout, \@headers );
+	
+	# print field values
+	foreach my $recordid (sort {$a <=> $b} keys %$report)
+	{
+		my @csv_values = ();
+		
+		# eprint
+		my $eprint = $report->{$recordid}->{eprint};
+		foreach my $fieldname (keys %$eprint)
+		{
+			my $multiple = $eprint->{$fieldname}->{multiple};
+			my $csv_value = '';
+			my $values = $eprint->{$fieldname}->{values};
+			if ($multiple == 0)
+			{
+				$csv_value = $values;
+				if (defined $csv_value)
+				{
+					if ($csv_value =~ /\r/ )
+					{
+						print STDERR "EPrint $recordid, field $fieldname contains carriage returns.\n";
+						$csv_value =~ s/\r//g;
+					}
+				}
+			}
+			else
+			{
+				my $first = 1;
+				foreach my $value (@$values)
+				{
+					if ($first)
+					{
+						$csv_value = $value;
+						$first = 0;
+					}
+					else
+					{
+						$csv_value .= ' ' . $value;
+					}
+				}
+			}
+			push @csv_values, $csv_value;
+		}
+		
+		# msapi
+		my $msapi = $report->{$recordid}->{msapi};
+		foreach my $msapi_key (keys %$msapi)
+		{
+			my $csv_value = $msapi->{$msapi_key};
+			push @csv_values, $csv_value;
+		}
+		
+		$csv->print( $csvout, \@csv_values );
+	}
+	
+	close $csvout;
+	
+	return;
+}
+
+
+sub create_dirs
+{
+	my ($dir) = @_;
+	
+	EPrints::Platform::mkdir( $dir );
+	EPrints::Platform::mkdir( $dir . '/json' );
+	
+	return;
+}
+
+sub read_mapping
+{
+	my ($mapping, $csv_file, $verbose) = @_;
+	
+	print STDOUT "Reading mappings from $csv_file\n" if $verbose;
+	
+	my $csv = Text::CSV->new() or die "Cannot use CSV: " . Text::CSV->error_diag ();
+   
+	my $line_count = 0;
+	
+	open(my $fh, '<', $csv_file) or die "Cannot read file '$csv_file' [$!]\n";
+	
+	while (my $line = <$fh>) 
+	{
+		$line_count++;
+    	chomp $line;
+    	
+    	if ( $csv->parse($line) ) 
+    	{
+    		my @fields = $csv->fields();
+    		
+    		my $orgid = $fields[0];
+    		my $discipline = $fields[1];
+    		
+    		$mapping->{$orgid} = $discipline;
+    	}
+		else
+    	{
+    		print STDERR "Line $line_count could not be parsed: $line\n";
+    	}
+	}
+	close($fh);
+	
+	return;
+}
+
+sub apply_mapping
+{
+	my ( $mapping, $param ) = @_;
+	
+	my $verbose = $param->{verbose};
+	my $report = $param->{report};
+	
+	foreach my $eprintid (keys %$report)
+	{
+		my $subjects = $report->{$eprintid}->{eprint}->{'subjects'}->{values};
+		my $disciplines;
+		
+		foreach my $subject (@$subjects)
+		{
+			my $discipline = "Other";
+			
+			if (defined $mapping->{$subject})
+			{
+				$discipline = $mapping->{$subject};
+			}
+			
+			push @$disciplines, $discipline;
+		}
+		
+		$report->{$eprintid}->{eprint}->{'disciplines'}->{multiple} = 1;
+		$report->{$eprintid}->{eprint}->{'disciplines'}->{values} = $disciplines;
+	}
+	
+	return;
+}
+
+
+sub get_stopwords
+{
+	my @STOPWORDS = qw(
+		a
+		about
+		above
+		abstract
+		across
+		after
+		again
+		against
+		all
+		almost
+		alone
+		along
+		already
+		also
+		although
+		always
+		among
+		an
+		analysis
+		analyzed
+		and
+		another
+		any
+		anybody
+		anyone
+		anything
+		anywhere
+		are
+		area
+		areas
+		around
+		as
+		ask
+		asked
+		asking
+		asks
+		associated
+		at
+		available
+		away
+		b
+		back
+		backed
+		backing
+		backs
+		based
+		be
+		became
+		because
+		become
+		becomes
+		been
+		before
+		began
+		behind
+		being
+		beings
+		best
+		better
+		between
+		big
+		both
+		but
+		by
+		c
+		came
+		can
+		cannot
+		case
+		cases
+		certain
+		certainly
+		clear
+		clearly
+		come
+		compared
+		considered
+		could
+		d
+		demonstrate
+		demonstrated
+		described
+		did
+		differ
+		different
+		differently
+		discussed
+		do
+		does
+		done
+		down
+		down
+		downed
+		downing
+		downs
+		due
+		during
+		e
+		each
+		early
+		eight
+		either
+		end
+		ended
+		ending
+		ends
+		enough
+		establish
+		established
+		establishes
+		evaluated
+		even
+		evenly
+		ever
+		every
+		everybody
+		everyone
+		everything
+		everywhere
+		f
+		face
+		faces
+		fact
+		facts
+		far
+		felt
+		few
+		find
+		findings
+		finds
+		first
+		five
+		for
+		four
+		from
+		full
+		fully
+		further
+		furthered
+		furthering
+		furthers
+		g
+		gave
+		general
+		generally
+		get
+		gets
+		give
+		given
+		gives
+		go
+		going
+		good
+		goods
+		got
+		great
+		greater
+		greatest
+		group
+		grouped
+		grouping
+		groups
+		h
+		had
+		has
+		have
+		having
+		he
+		her
+		here
+		herself
+		high
+		high
+		high
+		higher
+		highest
+		him
+		himself
+		his
+		how
+		however
+		i
+		if
+		ii
+		iii
+		important
+		improve
+		improved
+		in
+		including
+		increased
+		interest
+		interested
+		interesting
+		interests
+		into
+		is
+		it
+		its
+		itself
+		j
+		just
+		k
+		keep
+		keeps
+		kind
+		knew
+		know
+		known
+		knows
+		l
+		large
+		largely
+		last
+		later
+		latest
+		least
+		less
+		let
+		lets
+		like
+		likely
+		long
+		longer
+		longest
+		m
+		made
+		make
+		making
+		man
+		many
+		may
+		me
+		member
+		members
+		men
+		method
+		might
+		more
+		moreover
+		most
+		mostly
+		mr
+		mrs
+		much
+		must
+		my
+		myself
+		n
+		near
+		necessary
+		need
+		needed
+		needing
+		needs
+		never
+		new
+		new
+		newer
+		newest
+		next
+		nine
+		no
+		nobody
+		non
+		noone
+		not
+		nothing
+		now
+		nowhere
+		number
+		numbers
+		o
+		obtained
+		of
+		off
+		often
+		old
+		older
+		oldest
+		on
+		once
+		one
+		only
+		open
+		opened
+		opening
+		opens
+		or
+		order
+		ordered
+		ordering
+		orders
+		other
+		others
+		our
+		out
+		over
+		p
+		part
+		parted
+		particular
+		parting
+		parts
+		per
+		perhaps
+		place
+		places
+		point
+		pointed
+		pointing
+		points
+		possible
+		potentially
+		present
+		presented
+		presenting
+		presents
+		problem
+		problems
+		produced
+		proposed
+		provided
+		provides
+		put
+		puts
+		q
+		quite
+		r
+		rather
+		really
+		recent
+		related
+		report
+		reported
+		required
+		result
+		results
+		right
+		right
+		room
+		rooms
+		s
+		said
+		same
+		saw
+		say
+		says
+		second
+		seconds
+		see
+		seem
+		seemed
+		seeming
+		seems
+		sees
+		seven
+		several
+		shall
+		she
+		should
+		show
+		showed
+		showing
+		shows
+		side
+		sides
+		since
+		six
+		small
+		smaller
+		smallest
+		so
+		some
+		somebody
+		someone
+		something
+		somewhere
+		state
+		states
+		still
+		study
+		such
+		suggest
+		sure
+		t
+		take
+		taken
+		ten
+		than
+		that
+		the
+		their
+		them
+		then
+		there
+		therefore
+		these
+		they
+		thing
+		things
+		think
+		thinks
+		this
+		those
+		though
+		thought
+		thoughts
+		three
+		through
+		thus
+		to
+		today
+		together
+		too
+		took
+		toward
+		turn
+		turned
+		turning
+		turns
+		two
+		u
+		under
+		until
+		up
+		upon
+		us
+		use
+		used
+		uses
+		using
+		v
+		various
+		very
+		w
+		want
+		wanted
+		wanting
+		wants
+		was
+		way
+		ways
+		we
+		well
+		wells
+		went
+		were
+		what
+		when
+		where
+		whether
+		which
+		whichever
+		while
+		who
+		whole
+		whose
+		why
+		will
+		with
+		within
+		without
+		work
+		worked
+		working
+		works
+		would
+		x
+		y
+		year
+		years
+		yet
+		you
+		young
+		younger
+		youngest
+		your
+		yours
+		z		
+		ab
+		aber
+		aber
+		ach
+		acht
+		achte
+		achten
+		achter
+		achtes
+		ag
+		alle
+		allein
+		allem
+		allen
+		aller
+		allerdings
+		alles
+		allgemeinen
+		als
+		als
+		also
+		am
+		an
+		andere
+		anderen
+		andern
+		anders
+		au
+		auch
+		auch
+		auf
+		aus
+		ausser
+		außer
+		ausserdem
+		außerdem
+		bald
+		bei
+		beide
+		beiden
+		beim
+		beispiel
+		bekannt
+		bereits
+		besonders
+		besser
+		besten
+		bin
+		bis
+		bisher
+		bist
+		da
+		dabei
+		dadurch
+		dafür
+		dagegen
+		daher
+		dahin
+		dahinter
+		damals
+		damit
+		danach
+		daneben
+		dank
+		dann
+		daran
+		darauf
+		daraus
+		darf
+		darfst
+		darin
+		darüber
+		darum
+		darunter
+		das
+		das
+		dasein
+		daselbst
+		dass
+		daß
+		dasselbe
+		davon
+		davor
+		dazu
+		dazwischen
+		dein
+		deine
+		deinem
+		deiner
+		dem
+		dementsprechend
+		demgegenüber
+		demgemäss
+		demgemäß
+		demselben
+		demzufolge
+		den
+		denen
+		denn
+		denn
+		denselben
+		der
+		deren
+		derjenige
+		derjenigen
+		dermassen
+		dermaßen
+		derselbe
+		derselben
+		des
+		deshalb
+		desselben
+		dessen
+		deswegen
+		d.h
+		dich
+		die
+		diejenige
+		diejenigen
+		dies
+		diese
+		dieselbe
+		dieselben
+		diesem
+		diesen
+		dieser
+		dieses
+		dir
+		doch
+		dort
+		drei
+		drin
+		dritte
+		dritten
+		dritter
+		drittes
+		du
+		durch
+		durchaus
+		dürfen
+		dürft
+		durfte
+		durften
+		eben
+		ebenso
+		ehrlich
+		ei
+		eigen
+		eigene
+		eigenen
+		eigener
+		eigenes
+		ein
+		einander
+		eine
+		einem
+		einen
+		einer
+		eines
+		einige
+		einigen
+		einiger
+		einiges
+		einmal
+		einmal
+		eins
+		elf
+		en
+		ende
+		endlich
+		entweder
+		entweder
+		er
+		ernst
+		erst
+		erste
+		ersten
+		erster
+		erstes
+		es
+		etwa
+		etwas
+		euch
+		früher
+		fünf
+		fünfte
+		fünften
+		fünfter
+		fünftes
+		für
+		gab
+		ganz
+		ganze
+		ganzen
+		ganzer
+		ganzes
+		gar
+		gedurft
+		gegen
+		gegenüber
+		gehabt
+		gehen
+		geht
+		gekannt
+		gekonnt
+		gemacht
+		gemocht
+		gemusst
+		genug
+		gerade
+		gern
+		gesagt
+		gesagt
+		geschweige
+		gewesen
+		gewollt
+		geworden
+		gibt
+		ging
+		gleich
+		gross
+		groß
+		grosse
+		große
+		grossen
+		großen
+		grosser
+		großer
+		grosses
+		großes
+		gut
+		gute
+		guter
+		gutes
+		habe
+		haben
+		habt
+		hast
+		hat
+		hatte
+		hätte
+		hatten
+		hätten
+		heisst
+		her
+		heute
+		hier
+		hin
+		hinter
+		hoch
+		ich
+		ihm
+		ihn
+		ihnen
+		ihr
+		ihre
+		ihrem
+		ihren
+		ihrer
+		ihres
+		im
+		immer
+		in
+		indem
+		infolgedessen
+		ins
+		irgend
+		ist
+		ja
+		jahr
+		jahre
+		jahren
+		je
+		jede
+		jedem
+		jeden
+		jeder
+		jedermann
+		jedermanns
+		jedoch
+		jemand
+		jemandem
+		jemanden
+		jene
+		jenem
+		jenen
+		jener
+		jenes
+		jetzt
+		kam
+		kann
+		kannst
+		kaum
+		kein
+		keine
+		keinem
+		keinen
+		keiner
+		kleine
+		kleinen
+		kleiner
+		kleines
+		kommen
+		kommt
+		können
+		könnt
+		konnte
+		könnte
+		konnten
+		kurz
+		lang
+		lange
+		lange
+		leicht
+		leide
+		lieber
+		los
+		machen
+		macht
+		machte
+		mag
+		magst
+		mahn
+		man
+		manche
+		manchem
+		manchen
+		mancher
+		manches
+		mann
+		mehr
+		mein
+		meine
+		meinem
+		meinen
+		meiner
+		meines
+		mensch
+		menschen
+		mich
+		mir
+		mit
+		mittel
+		mochte
+		möchte
+		mochten
+		mögen
+		möglich
+		mögt
+		morgen
+		muss
+		muß
+		müssen
+		musst
+		müsst
+		musste
+		mussten
+		na
+		nach
+		nachdem
+		nahm
+		natürlich
+		neben
+		nein
+		neue
+		neuen
+		neun
+		neunte
+		neunten
+		neunter
+		neuntes
+		nicht
+		nicht
+		nichts
+		nie
+		niemand
+		niemandem
+		niemanden
+		noch
+		nun
+		nun
+		nur
+		ob
+		oben
+		oder
+		offen
+		oft
+		oft
+		ohne
+		Ordnung
+		recht
+		rechte
+		rechten
+		rechter
+		rechtes
+		richtig
+		rund
+		sa
+		sache
+		sagt
+		sagte
+		sah
+		satt
+		schlecht
+		Schluss
+		schon
+		sechs
+		sechste
+		sechsten
+		sechster
+		sechstes
+		sehr
+		sei
+		sei
+		seid
+		seien
+		sein
+		seine
+		seinem
+		seinen
+		seiner
+		seines
+		seit
+		seitdem
+		selbst
+		sich
+		sie
+		sieben
+		siebente
+		siebenten
+		siebenter
+		siebentes
+		sind
+		so
+		solang
+		solche
+		solchem
+		solchen
+		solcher
+		solches
+		soll
+		sollen
+		sollte
+		sollten
+		sondern
+		sonst
+		sowie
+		später
+		statt
+		tag
+		tage
+		tagen
+		tat
+		teil
+		tel
+		tritt
+		trotzdem
+		tun
+		über
+		überhaupt
+		übrigens
+		uhr
+		um
+		und
+		uns
+		unser
+		unsere
+		unserer
+		unter
+		vergangenen
+		viel
+		viele
+		vielem
+		vielen
+		vielleicht
+		vier
+		vierte
+		vierten
+		vierter
+		viertes
+		vom
+		von
+		vor
+		wahr
+		während
+		währenddem
+		währenddessen
+		wann
+		war
+		wäre
+		waren
+		wart
+		warum
+		was
+		wegen
+		weil
+		weit
+		weiter
+		weitere
+		weiteren
+		weiteres
+		welche
+		welchem
+		welchen
+		welcher
+		welches
+		wem
+		wen
+		wenig
+		wenig
+		wenige
+		weniger
+		weniges
+		wenigstens
+		wenn
+		wenn
+		wer
+		werde
+		werden
+		werdet
+		wessen
+		wie
+		wie
+		wieder
+		will
+		willst
+		wir
+		wird
+		wirklich
+		wirst
+		wo
+		wohl
+		wollen
+		wollt
+		wollte
+		wollten
+		worden
+		wurde
+		würde
+		wurden
+		würden
+		zehn
+		zehnte
+		zehnten
+		zehnter
+		zehntes
+		zeit
+		zu
+		zuerst
+		zugleich
+		zum
+		zum
+		zunächst
+		zur
+		zurück
+		zusammen
+		zwanzig
+		zwar
+		zwar
+		zwei
+		zweite
+		zweiten
+		zweiter
+		zweites
+		zwischen
+		zwölf
+		à
+		â
+		abord
+		afin
+		ah
+		ai
+		aie
+		ainsi
+		allaient
+		allo
+		allô
+		allons
+		après
+		assez
+		attendu
+		au
+		aucun
+		aucune
+		aujourd
+		aujourd'hui
+		auquel
+		aura
+		auront
+		aussi
+		autre
+		autres
+		aux
+		auxquelles
+		auxquels
+		avaient
+		avais
+		avait
+		avant
+		avec
+		avoir
+		ayant
+		bah
+		beaucoup
+		bien
+		bigre
+		boum
+		bravo
+		brrr
+		ça
+		car
+		ce
+		ceci
+		cela
+		celle
+		celle-ci
+		celle-là
+		celles
+		celles-ci
+		celles-là
+		celui
+		celui-ci
+		celui-là
+		cent
+		cependant
+		certain
+		certaine
+		certaines
+		certains
+		certes
+		ces
+		cet
+		cette
+		ceux
+		ceux-ci
+		ceux-là
+		chacun
+		chaque
+		cher
+		chère
+		chères
+		chers
+		chez
+		chiche
+		chut
+		ci
+		cinq
+		cinquantaine
+		cinquante
+		cinquantième
+		cinquième
+		clac
+		clic
+		combien
+		comme
+		comment
+		compris
+		concernant
+		contre
+		couic
+		crac
+		da
+		dans
+		de
+		debout
+		dedans
+		dehors
+		delà
+		depuis
+		derrière
+		des
+		dès
+		désormais
+		desquelles
+		desquels
+		dessous
+		dessus
+		deux
+		deuxième
+		deuxièmement
+		devant
+		devers
+		devra
+		différent
+		différente
+		différentes
+		différents
+		dire
+		divers
+		diverse
+		diverses
+		dix
+		dix-huit
+		dixième
+		dix-neuf
+		dix-sept
+		doit
+		doivent
+		donc
+		dont
+		douze
+		douzième
+		dring
+		du
+		duquel
+		durant
+		effet
+		eh
+		elle
+		elle-même
+		elles
+		elles-mêmes
+		en
+		encore
+		entre
+		envers
+		environ
+		es
+		ès
+		est
+		et
+		etant
+		étaient
+		étais
+		était
+		étant
+		etc
+		été
+		etre
+		être
+		eu
+		euh
+		eux
+		eux-mêmes
+		excepté
+		façon
+		fais
+		faisaient
+		faisant
+		fait
+		feront
+		fi
+		flac
+		floc
+		font
+		gens
+		ha
+		hé
+		hein
+		hélas
+		hem
+		hep
+		hi
+		ho
+		holà
+		hop
+		hormis
+		hors
+		hou
+		houp
+		hue
+		hui
+		huit
+		huitième
+		hum
+		hurrah
+		il
+		ils
+		importe
+		je
+		jusqu
+		jusque
+		k
+		la
+		là
+		laquelle
+		las
+		le
+		lequel
+		les
+		lès
+		lesquelles
+		lesquels
+		leur
+		leurs
+		longtemps
+		lorsque
+		lui
+		lui-même
+		ma
+		maint
+		mais
+		malgré
+		me
+		même
+		mêmes
+		merci
+		mes
+		mien
+		mienne
+		miennes
+		miens
+		mille
+		mince
+		moi
+		moi-même
+		moins
+		mon
+		moyennant
+		na
+		ne
+		néanmoins
+		neuf
+		neuvième
+		ni
+		nombreuses
+		nombreux
+		non
+		nos
+		notre
+		nôtre
+		nôtres
+		nous
+		nous-mêmes
+		nul
+		o|
+		ô
+		oh
+		ohé
+		olé
+		ollé
+		on
+		ont
+		onze
+		onzième
+		ore
+		ou
+		où
+		ouf
+		ouias
+		oust
+		ouste
+		outre
+		paf
+		pan
+		par
+		parmi
+		partant
+		particulier
+		particulière
+		particulièrement
+		pas
+		passé
+		pendant
+		personne
+		peu
+		peut
+		peuvent
+		peux
+		pff
+		pfft
+		pfut
+		pif
+		plein
+		plouf
+		plus
+		plusieurs
+		plutôt
+		pouah
+		pour
+		pourquoi
+		premier
+		première
+		premièrement
+		près
+		proche
+		psitt
+		puisque
+		qu
+		quand
+		quant
+		quanta
+		quant-à-soi
+		quarante
+		quatorze
+		quatre
+		quatre-vingt
+		quatrième
+		quatrièmement
+		que
+		quel
+		quelconque
+		quelle
+		quelles
+		quelque
+		quelques
+		quelqu'un
+		quels
+		qui
+		quiconque
+		quinze
+		quoi
+		quoique
+		revoici
+		revoilà
+		rien
+		sa
+		sacrebleu
+		sans
+		sapristi
+		sauf
+		se
+		seize
+		selon
+		sept
+		septième
+		sera
+		seront
+		ses
+		si
+		sien
+		sienne
+		siennes
+		siens
+		sinon
+		six
+		sixième
+		soi
+		soi-même
+		soit
+		soixante
+		son
+		sont
+		sous
+		stop
+		suis
+		suivant
+		sur
+		surtout
+		ta
+		tac
+		tant
+		te
+		té
+		tel
+		telle
+		tellement
+		telles
+		tels
+		tenant
+		tes
+		tic
+		tien
+		tienne
+		tiennes
+		tiens
+		toc
+		toi
+		toi-même
+		ton
+		touchant
+		toujours
+		tous
+		tout
+		toute
+		toutes
+		treize
+		trente
+		très
+		trois
+		troisième
+		troisièmement
+		trop
+		tsoin
+		tsouin
+		tu
+		un
+		une
+		unes
+		uns
+		va
+		vais
+		vas
+		vé
+		vers
+		via
+		vif
+		vifs
+		vingt
+		vivat
+		vive
+		vives
+		vlan
+		voici
+		voilà
+		vont
+		vos
+		votre
+		vôtre
+		vôtres
+		vous
+		vous-mêmes
+		vu
+		zut
+		del
+		el
+		las
+		los
+		una
+	);
+	
+	return @STOPWORDS;
+}
+
+=head1 AUTHOR
+
+Martin Brändle <martin.braendle@id.uzh.ch>, Zentrale Informatik, University of Zurich
+
+=head1 COPYRIGHT
+
+=for COPYRIGHT BEGIN
+
+Copyright 2016- University of Zurich.
+
+=for COPYRIGHT END
+
+=for LICENSE BEGIN
+
+This file is part of ZORA based on EPrints L<http://www.eprints.org/>.
+
+EPrints is free software: you can redistribute it and/or modify it
+under the terms of the GNU Lesser General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+EPrints is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+License for more details.
+
+You should have received a copy of the GNU Lesser General Public
+License along with EPrints.  If not, see L<http://www.gnu.org/licenses/>.
+
+=for LICENSE END
+
