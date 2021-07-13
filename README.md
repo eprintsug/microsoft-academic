@@ -83,3 +83,5 @@ MA 02111-1307 USA
     row
   * querying and matching improved for technical symbols, special characters and LaTeX
     code in titles
+* July 2021
+  * MA retired
